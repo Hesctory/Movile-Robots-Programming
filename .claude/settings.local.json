@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ros2 node *)",
+      "Bash(ros2 topic *)",
+      "Bash(ros2 run *)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}
