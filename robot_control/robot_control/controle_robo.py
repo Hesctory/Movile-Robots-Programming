@@ -25,7 +25,7 @@ class ControleRobo(Node):
     # --- grid (must match robot_mapper constants) ---
     GRID_SIZE = 100
     GRID_RESOLUTION = 0.2
-    OBSTACLE_INFLATE_RADIUS = 2   # cells of safety margin around obstacles
+    OBSTACLE_INFLATE_RADIUS = 1   # cells of safety margin around obstacles
 
     # --- distances (metres) ---
     OBSTACLE_FRONT = 0.6
@@ -37,6 +37,9 @@ class ControleRobo(Node):
     MIN_FLAG_PIXELS = 50
     CONFIRM_FRAMES = 5
     CAMERA_FOV = 1.57
+    # Calibrate: drive to exactly CLOSE_ENOUGH metres from the flag and read
+    # flag_pixel_height, then set FLAG_CAM_K = CLOSE_ENOUGH * pixel_height.
+    FLAG_CAM_K = 84.0   # pixel_height × distance (m) — tune in simulation
 
     # --- re-acquisition after losing flag ---
     SEARCH_TICKS_MAX = 60
@@ -47,8 +50,8 @@ class ControleRobo(Node):
     DONE_TICKS = 10
 
     # --- waypoint following ---
-    WAYPOINT_TOLERANCE = 0.35   # metres — distance to consider a waypoint reached
-    WAYPOINT_STRIDE = 5         # keep every Nth cell from A* path
+    WAYPOINT_TOLERANCE = 0.20   # metres — distance to consider a waypoint reached
+    WAYPOINT_STRIDE = 2         # keep every Nth cell from A* path
     REPLAN_INTERVAL = 50        # ticks between periodic re-plans (~5 s)
 
     # --- POSITION_TO_COLLECT guards ---
@@ -121,6 +124,8 @@ class ControleRobo(Node):
         self.flag_confidence = 0
         self.last_angular_error = 0.0
         self.last_flag_bearing = None
+        self.flag_pixel_height = 0       # bounding-box height of flag in camera frame (pixels)
+        self.last_cam_dist_pos = float('inf')  # last reliable cam-derived distance, used in POSITION_TO_COLLECT
 
         # Flag world position (estimated at detection confirmation)
         self.flag_world_pos = None   # (x, y) in metres
@@ -187,11 +192,13 @@ class ControleRobo(Node):
             ys, xs = np.where(mask)
             cx = float(np.mean(xs))
             self.flag_visible = True
+            self.flag_pixel_height = int(np.max(ys) - np.min(ys)) + 1
             self.flag_angular_error = (cx - w / 2.0) / w
             angular_error_rad = self.flag_angular_error * self.CAMERA_FOV
             self.last_flag_bearing = self.robot_heading - angular_error_rad
         else:
             self.flag_visible = False
+            self.flag_pixel_height = 0
 
     def _imu_callback(self, msg: Imu):
         q = msg.orientation
@@ -308,9 +315,15 @@ class ControleRobo(Node):
     def _navigating(self):
         if self.flag_visible:
             self.last_angular_error = self.flag_angular_error
-            # Refine the flag world position estimate while it's visible
+            # Refine the flag world position estimate while it's visible.
+            # Prefer the camera-derived distance (label-specific, not confused by
+            # walls or other obstacles in the same LiDAR direction); fall back to
+            # LiDAR only when pixel height is unavailable.
             if self.last_flag_bearing is not None:
-                dist = self._range_at_world_bearing(self.last_flag_bearing)
+                if self.flag_pixel_height > 0:
+                    dist = self.FLAG_CAM_K / self.flag_pixel_height
+                else:
+                    dist = self._range_at_world_bearing(self.last_flag_bearing)
                 if math.isfinite(dist) and dist > 0.2:
                     self.flag_world_pos = (
                         self.robot_x + dist * math.cos(self.last_flag_bearing),
@@ -318,14 +331,18 @@ class ControleRobo(Node):
                     )
                     self.get_logger().debug(
                         f'Flag pos refined: ({self.flag_world_pos[0]:.2f}, {self.flag_world_pos[1]:.2f}), '
-                        f'dist={dist:.2f} m'
+                        f'dist={dist:.2f} m ({"cam" if self.flag_pixel_height > 0 else "lidar"})'
                     )
 
         # PRIORITY 1: flag is close and aligned — hand off to fine approach.
-        # Requires FLAG_CLOSE_CONFIRM consecutive ticks to avoid transitioning
-        # when a random obstacle briefly appears in front while the flag is visible.
+        # Distance is estimated from the camera bounding-box height (pinhole model:
+        # dist = FLAG_CAM_K / pixel_height) so it is flag-specific and immune to
+        # walls or other obstacles that happen to be in the same LiDAR sector.
+        cam_dist = (self.FLAG_CAM_K / self.flag_pixel_height
+                    if self.flag_visible and self.flag_pixel_height > 0
+                    else float('inf'))
         if (self.flag_visible
-                and self.front_dist < self.CLOSE_ENOUGH
+                and cam_dist < self.CLOSE_ENOUGH
                 and abs(self.last_angular_error) < 0.1):
             self._flag_close_ticks += 1
             self.get_logger().debug(
@@ -340,11 +357,13 @@ class ControleRobo(Node):
         # PRIORITY 2: follow A* waypoints (if a path was computed)
         if self.waypoints and self.waypoint_idx < len(self.waypoints):
             # Periodic re-plan to incorporate new map data
-            self._replan_ticks += 1
+            self._replan_ticks += 1 
             if self._replan_ticks >= self.REPLAN_INTERVAL and self.flag_world_pos is not None:
                 self._replan_ticks = 0
                 self.get_logger().info('Periodic re-plan triggered')
                 self._plan_path_to_flag()
+                if not self.waypoints:
+                    return
             self._follow_waypoints()
             return
 
@@ -374,8 +393,21 @@ class ControleRobo(Node):
                 f'Waypoint reached — advancing to {self.waypoint_idx}/{len(self.waypoints)}'
             )
             if self.waypoint_idx >= len(self.waypoints):
-                self.get_logger().info('All waypoints reached — switching to fine approach')
-                self._go_to(State.POSITION_TO_COLLECT)
+                # Sanity-check: only hand off when the flag is genuinely close.
+                # If the A* goal was placed on a wrong LiDAR hit (wall in the flag
+                # direction), waypoints end far from the real flag — re-plan instead.
+                if self.flag_visible and self.flag_pixel_height > 0:
+                    wp_cam_dist = self.FLAG_CAM_K / self.flag_pixel_height
+                else:
+                    wp_cam_dist = self.front_dist
+                if wp_cam_dist < self.CLOSE_ENOUGH:
+                    self.get_logger().info('All waypoints reached — switching to fine approach')
+                    self._go_to(State.POSITION_TO_COLLECT)
+                else:
+                    self.get_logger().warn(
+                        f'All waypoints reached but flag still {wp_cam_dist:.2f} m away — re-planning'
+                    )
+                    self._plan_path_to_flag()
             return
 
         target_bearing = math.atan2(dy, dx)
@@ -384,8 +416,10 @@ class ControleRobo(Node):
         # Obstacle in the direction we are heading: request a re-plan on the next
         # map update so the grid is guaranteed to include this new obstacle.
         if self.front_dist < self.OBSTACLE_FRONT and abs(heading_err) < 0.5:
-            self.get_logger().info('Obstacle on waypoint path — waiting for map update to re-plan')
+            self.get_logger().info('Obstacle on waypoint path — turning toward free space while waiting for re-plan')
             self._replan_requested = True
+            turn_dir = 1.0 if self.front_left_dist >= self.front_right_dist else -1.0
+            self._publish(0.0, turn_dir * self.TURN_SPEED)
             return
 
         angular = max(-self.TURN_SPEED, min(self.TURN_SPEED, self.KP_ANGULAR_WAYPOINT * heading_err))
@@ -465,13 +499,15 @@ class ControleRobo(Node):
 
         if self.flag_visible:
             self.last_angular_error = self.flag_angular_error
+            if self.flag_pixel_height > 0:
+                self.last_cam_dist_pos = self.FLAG_CAM_K / self.flag_pixel_height
         err = self.last_angular_error
         if abs(err) > self.ANGULAR_ALIGN_THRESH:
             angular = max(-self.TURN_SPEED, min(self.TURN_SPEED, -self.KP_ANGULAR_ALIGN * err))
             self._publish(0.0, angular)
             self._done_ticks = 0
             return
-        dist_err = self.front_dist - self.TARGET_DIST
+        dist_err = self.last_cam_dist_pos - self.TARGET_DIST
         if abs(dist_err) > self.DIST_TOLERANCE:
             self._publish(self.CREEP_SPEED if dist_err > 0 else -self.CREEP_SPEED, 0.0)
             self._done_ticks = 0
@@ -500,6 +536,7 @@ class ControleRobo(Node):
             return
 
         start = self._world_to_grid(self.robot_x, self.robot_y)
+
 
         # Place the A* goal CLOSE_ENOUGH metres in front of the flag (toward the
         # robot), not on the flag pole itself.  The flag pole is marked as an
@@ -768,13 +805,20 @@ class ControleRobo(Node):
                 self.get_logger().info('Re-planning A* to known flag position')
                 self._plan_path_to_flag()
             elif self.last_flag_bearing is not None:
-                # First time entering: estimate flag position from LiDAR + bearing
-                dist = self._range_at_world_bearing(self.last_flag_bearing)
+                # First time entering: estimate flag position from camera (label-specific)
+                # or fall back to LiDAR if camera height is unavailable.
+                if self.flag_pixel_height > 0:
+                    dist = self.FLAG_CAM_K / self.flag_pixel_height
+                    self.get_logger().info(
+                        f'Flag distance from camera: {dist:.2f} m (pixel_height={self.flag_pixel_height})'
+                    )
+                else:
+                    dist = self._range_at_world_bearing(self.last_flag_bearing)
                 if math.isfinite(dist) and dist > 0.2:
                     fx = self.robot_x + dist * math.cos(self.last_flag_bearing)
                     fy = self.robot_y + dist * math.sin(self.last_flag_bearing)
                     self.get_logger().info(
-                        f'Flag at ({fx:.2f}, {fy:.2f}), LiDAR dist={dist:.2f} m'
+                        f'Flag at ({fx:.2f}, {fy:.2f}), dist={dist:.2f} m'
                     )
                 else:
                     far = 8.0
@@ -788,6 +832,7 @@ class ControleRobo(Node):
         elif new_state == State.POSITION_TO_COLLECT:
             self._done_ticks = 0
             self._pos_ticks = 0
+            self.last_cam_dist_pos = float('inf')
 
 
 def main(args=None):
