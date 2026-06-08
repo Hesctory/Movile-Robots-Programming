@@ -68,7 +68,7 @@ class ControleRobo(Node):
     TIPPED_INFLATE_RADIUS = 3  # inflate tipped area by this many cells in every direction
 
     # --- speeds ---
-    EXPLORE_SPEED = 0.15
+    EXPLORE_SPEED = 0.25
     NAV_SPEED = 0.12
     CREEP_SPEED = 0.06
     TURN_SPEED = 0.4
@@ -82,6 +82,15 @@ class ControleRobo(Node):
     # --- exploration ---
     SPIN_TICKS = int(2 * math.pi / (TURN_SPEED * 0.1)) + 5
     OBSTACLE_CLEAR = 0.8   # hysteresis: stop avoiding only when front opens to this distance
+
+    # --- circumnavigation ---
+    CIRCUM_WALL_DIST = 0.45   # target gap to keep from the wall (m)
+    CIRCUM_KP        = 1.8    # P-gain for wall-distance controller
+    CIRCUM_MIN_TICKS = 15     # minimum ticks before exit is allowed (~1.5 s)
+    CIRCUM_MAX_TICKS = 300    # timeout before aborting (~30 s)
+
+    # --- tipped cells ---
+    TIPPED_CELLS_TTL = 600    # ticks before tipped cells are forgotten (~60 s)
 
     def __init__(self):
         super().__init__('controle_robo')
@@ -109,6 +118,8 @@ class ControleRobo(Node):
         self.front_dist = float('inf')
         self.front_left_dist = float('inf')
         self.front_right_dist = float('inf')
+        self._left_dist = float('inf')
+        self._right_dist = float('inf')
         self.last_scan = None
 
         # Robot pose (full, from ground truth)
@@ -149,11 +160,15 @@ class ControleRobo(Node):
         self._spin_ticks = 0
         self._spinning = True
 
-        # Visual servoing fallback avoidance
-        self._avoiding = False
-        self._avoid_dir = 1
-        self._avoid_ticks = 0
-        self._avoid_max = 20
+        # Circumnavigation
+        self._circumnavigating  = False
+        self._circum_side       = -1     # -1 = follow right wall, +1 = follow left wall
+        self._circum_start_dist = 0.0
+        self._circum_ticks      = 0
+
+        # A* / tipped cells
+        self._astar_failed       = False
+        self._tipped_cells_age   = 0     # ticks since last tipping event
 
         # Re-acquisition search
         self._search_ticks = 0
@@ -172,9 +187,11 @@ class ControleRobo(Node):
 
     def scan_callback(self, msg: LaserScan):
         self.last_scan = msg
-        self.front_dist = self._sector_min(msg, -30, 30)
-        self.front_left_dist = self._sector_min(msg, 30, 90)
-        self.front_right_dist = self._sector_min(msg, -90, -30)
+        self.front_dist       = self._sector_min(msg,  -30,  30)
+        self.front_left_dist  = self._sector_min(msg,   30,  90)
+        self.front_right_dist = self._sector_min(msg,  -90, -30)
+        self._left_dist       = self._sector_min(msg,   60, 120)
+        self._right_dist      = self._sector_min(msg, -120, -60)
 
     def pose_callback(self, msg: Pose):
         self.robot_x = msg.position.x
@@ -224,10 +241,18 @@ class ControleRobo(Node):
     # ------------------------------------------------------------------
 
     def move_robot(self):
+        if self._tipped_cells:
+            self._tipped_cells_age += 1
+            if self._tipped_cells_age >= self.TIPPED_CELLS_TTL:
+                self._tipped_cells.clear()
+                self._tipped_cells_age = 0
+                self.get_logger().info('Tipped cells expired — memory cleared')
+
         if abs(self.robot_pitch) > self.TILT_THRESHOLD:
             if self._tilt_recovery_ticks == 0:   # first detection this event — decide direction once
                 self._tilt_turn_dir = self._tilt_turn_direction()
                 self._record_tipped_location()
+                self._tipped_cells_age = 0   # reset TTL on new tipping event
                 self.get_logger().warn(
                     f'Tilt detected ({math.degrees(self.robot_pitch):.1f}°) — reversing '
                     f'with turn={self._tilt_turn_dir:+.2f}'
@@ -301,13 +326,17 @@ class ControleRobo(Node):
     # ------------------------------------------------------------------
 
     def _flag_detected(self):
-        self._stop()
         if self.flag_visible:
+            self._circumnavigating = False
+            self._stop()
             self.flag_confidence += 1
             self.get_logger().debug(f'Flag confidence: {self.flag_confidence}/{self.CONFIRM_FRAMES}')
             if self.flag_confidence >= self.CONFIRM_FRAMES:
                 self._go_to(State.NAVIGATING_TO_FLAG)
+        elif self.front_dist < self.OBSTACLE_FRONT or self._circumnavigating:
+            self._circumnavigate()
         else:
+            self._stop()
             self.flag_confidence = max(0, self.flag_confidence - 1)
             self.get_logger().debug(f'Flag lost — confidence decaying: {self.flag_confidence}')
             if self.flag_confidence == 0:
@@ -374,12 +403,13 @@ class ControleRobo(Node):
         # Exception: if tipped cells are present, A* already failed on this approach corridor.
         # Visual servoing would drive blindly into the same obstacle, so return to EXPLORING
         # instead and let the robot find a different angle before re-planning.
-        if self._tipped_cells:
+        if self._tipped_cells and self._astar_failed:
             self.get_logger().warn(
-                'No A* path with tipped cells present — clearing flag estimate and returning to EXPLORING'
+                'A* found no path with tipped cells present — clearing flag estimate and returning to EXPLORING'
             )
             self.flag_world_pos = None
-            self.last_flag_bearing = None   # force the robot to re-spot from a new angle
+            self.last_flag_bearing = None
+            self._astar_failed = False
             self._go_to(State.EXPLORING)
             return
         self._visual_servo_to_flag()
@@ -407,10 +437,29 @@ class ControleRobo(Node):
                     self.get_logger().info('All waypoints reached — switching to fine approach')
                     self._go_to(State.POSITION_TO_COLLECT)
                 else:
-                    self.get_logger().warn(
-                        f'All waypoints reached but flag still {wp_cam_dist:.2f} m away — re-planning'
-                    )
-                    self._plan_path_to_flag()
+                    # Check if the robot is already at the A* goal position.
+                    # If so, re-planning produces the same trivial path — switch to visual servo instead.
+                    astar_goal_close = False
+                    if self.flag_world_pos is not None:
+                        flag_x, flag_y = self.flag_world_pos
+                        bearing_to_flag = math.atan2(flag_y - self.robot_y, flag_x - self.robot_x)
+                        goal_wx = flag_x - self.CLOSE_ENOUGH * math.cos(bearing_to_flag)
+                        goal_wy = flag_y - self.CLOSE_ENOUGH * math.sin(bearing_to_flag)
+                        dist_to_goal = math.sqrt((self.robot_x - goal_wx) ** 2 + (self.robot_y - goal_wy) ** 2)
+                        astar_goal_close = dist_to_goal < self.WAYPOINT_TOLERANCE
+                    trivial_path = len(self.waypoints) <= 2
+                    if astar_goal_close or trivial_path:
+                        self.get_logger().warn(
+                            f'All waypoints reached but flag still {wp_cam_dist:.2f} m away — '
+                            f'{"trivial path" if trivial_path else "already at A* goal"}, '
+                            f'switching to visual servo'
+                        )
+                        self.waypoints = []
+                    else:
+                        self.get_logger().warn(
+                            f'All waypoints reached but flag still {wp_cam_dist:.2f} m away — re-planning'
+                        )
+                        self._plan_path_to_flag()
             return
 
         target_bearing = math.atan2(dy, dx)
@@ -435,25 +484,11 @@ class ControleRobo(Node):
         if self.flag_visible:
             self._search_ticks = 0
 
-        if self.front_dist < self.OBSTACLE_FRONT:
-            if not self._avoiding:
-                self._avoiding = True
-                self._avoid_ticks = 0
-                self._avoid_dir = 1 if self.front_left_dist >= self.front_right_dist else -1
-                self.get_logger().info(
-                    f'Visual servo: obstacle avoidance engaged — turning {"left" if self._avoid_dir > 0 else "right"} '
-                    f'(front={self.front_dist:.2f} m)'
-                )
-            self._avoid_ticks += 1
-            if self._avoid_ticks > self._avoid_max:
-                self._avoid_dir *= -1
-                self._avoid_ticks = 0
-            self._publish(self.NAV_SPEED * 0.4, self._avoid_dir * self.TURN_SPEED)
+        if self.front_dist < self.OBSTACLE_FRONT or self._circumnavigating:
+            self._circumnavigate()
             return
 
-        if self._avoiding:
-            self.get_logger().info('Visual servo: obstacle avoidance cleared')
-        self._avoiding = False
+        self._circumnavigating = False
 
         if not self.flag_visible:
             self._reacquire_flag()
@@ -464,6 +499,58 @@ class ControleRobo(Node):
         angular = max(-self.TURN_SPEED, min(self.TURN_SPEED, -self.KP_ANGULAR_NAV * err))
         linear = self.NAV_SPEED if abs(err) < 0.15 else 0.0
         self._publish(linear, angular)
+
+    def _circumnavigate(self):
+        if not self._circumnavigating:
+            # More open on left  → turn left → obstacle on RIGHT → follow right wall (side=-1)
+            # More open on right → turn right → obstacle on LEFT → follow left wall  (side=+1)
+            self._circum_side = -1 if self.front_left_dist >= self.front_right_dist else +1
+            if self.flag_world_pos is not None:
+                dx = self.flag_world_pos[0] - self.robot_x
+                dy = self.flag_world_pos[1] - self.robot_y
+                self._circum_start_dist = math.sqrt(dx * dx + dy * dy)
+            else:
+                self._circum_start_dist = float('inf')
+            self._circum_ticks = 0
+            self._circumnavigating = True
+            self.get_logger().info(
+                f'Circumnavigation started — following '
+                f'{"right" if self._circum_side == -1 else "left"} wall, '
+                f'dist_to_flag={self._circum_start_dist:.2f} m'
+            )
+
+        self._circum_ticks += 1
+
+        if self._circum_ticks > self.CIRCUM_MAX_TICKS:
+            self.get_logger().warn('Circumnavigation timeout — aborting')
+            self._circumnavigating = False
+            return
+
+        # Exit: front clear, min time elapsed, and closer to flag than at start
+        if self._circum_ticks >= self.CIRCUM_MIN_TICKS and self.front_dist > self.OBSTACLE_CLEAR:
+            if self.flag_world_pos is not None:
+                dx = self.flag_world_pos[0] - self.robot_x
+                dy = self.flag_world_pos[1] - self.robot_y
+                if math.sqrt(dx * dx + dy * dy) < self._circum_start_dist:
+                    self.get_logger().info('Circumnavigation complete — resumed approach')
+                    self._circumnavigating = False
+                    return
+            else:
+                self.get_logger().info('Circumnavigation complete — front clear')
+                self._circumnavigating = False
+                return
+
+        # Front still blocked: turn sharply in circumnavigation direction
+        if self.front_dist < self.OBSTACLE_FRONT:
+            # side=-1 (right wall): turn left (+); side=+1 (left wall): turn right (-)
+            self._publish(0.0, -self._circum_side * self.TURN_SPEED)
+            return
+
+        # Wall-following P-controller
+        wall_dist = self._right_dist if self._circum_side == -1 else self._left_dist
+        angular = -self._circum_side * self.CIRCUM_KP * (self.CIRCUM_WALL_DIST - wall_dist)
+        angular = max(-self.TURN_SPEED, min(self.TURN_SPEED, angular))
+        self._publish(self.NAV_SPEED * 0.5, angular)
 
     def _reacquire_flag(self):
         if self.last_flag_bearing is None:
@@ -587,8 +674,10 @@ class ControleRobo(Node):
         if not path_cells:
             self.get_logger().warn('A* found no path — falling back to visual servoing')
             self.waypoints = []
+            self._astar_failed = True
             return
 
+        self._astar_failed = False
         # Thin the path: keep every WAYPOINT_STRIDE-th cell plus the final goal
         sampled = path_cells[::self.WAYPOINT_STRIDE]
         if sampled[-1] != path_cells[-1]:
@@ -796,9 +885,10 @@ class ControleRobo(Node):
             self._search_ticks = 0
         elif new_state == State.FLAG_DETECTED:
             self.flag_confidence = 0
+            self._circumnavigating = False
         elif new_state == State.NAVIGATING_TO_FLAG:
             self._search_ticks = 0
-            self._avoiding = False
+            self._circumnavigating = False
             self._replan_ticks = 0
             self._flag_close_ticks = 0
             self._replan_requested = False
