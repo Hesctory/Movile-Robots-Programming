@@ -6,7 +6,9 @@
       "Bash(ros2 run *)",
       "Bash(kill %1)",
       "Bash(wait)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Skill(ros2-engineering-skills)",
+      "Bash(timeout 5 python3 *)"
     ]
   }
 }

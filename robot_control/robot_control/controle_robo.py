@@ -11,6 +11,7 @@ from geometry_msgs.msg import Pose, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
 from sensor_msgs.msg import Image, Imu, LaserScan
+from std_msgs.msg import String
 
 
 class State(Enum):
@@ -87,6 +88,7 @@ class ControleRobo(Node):
 
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_pub = self.create_publisher(Path, '/astar_path', 10)
+        self.state_pub = self.create_publisher(String, '/robot_state', 1)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Image, '/robot_cam/labels_map', self.camera_callback, 10)
         self.create_subscription(Pose, '/model/prm_robot/pose', self.pose_callback, 10)
@@ -162,6 +164,7 @@ class ControleRobo(Node):
         self._flag_close_ticks = 0   # consecutive ticks where flag is close+aligned
 
         self.get_logger().info('ControleRobo ready — EXPLORING')
+        self.state_pub.publish(String(data=self.state.name))
 
     # ------------------------------------------------------------------
     # Sensor callbacks
@@ -787,6 +790,7 @@ class ControleRobo(Node):
     def _go_to(self, new_state: State):
         self.get_logger().info(f'{self.state.name} → {new_state.name}')
         self.state = new_state
+        self.state_pub.publish(String(data=new_state.name))
         if new_state == State.EXPLORING:
             self.flag_confidence = 0
             self._search_ticks = 0
