@@ -54,6 +54,7 @@ class ControleRobo(Node):
     WAYPOINT_TOLERANCE = 0.20   # metres — distance to consider a waypoint reached
     WAYPOINT_STRIDE = 2         # keep every Nth cell from A* path
     REPLAN_INTERVAL = 50        # ticks between periodic re-plans (~5 s)
+    ASTAR_RETRY_INTERVAL = 20   # ticks — retry A* every 2 s when it previously failed
 
     # --- POSITION_TO_COLLECT guards ---
     FLAG_CLOSE_CONFIRM = 4      # consecutive ticks flag must be close+aligned before switching
@@ -64,6 +65,7 @@ class ControleRobo(Node):
     TILT_LIDAR_CLOSE = 0.8     # metres — LiDAR side reading below this counts as "seeing" the cause
     TILT_ROLL_THRESH = 0.10    # radians — minimum roll to trust as IMU direction signal
     RECOVERY_TICKS = 25        # ticks to keep reversing after tilt clears (~2.5 s)
+    TILT_ADVANCE_TICKS = 17    # ticks of forward creep after tilt recovery (~0.1 m at CREEP_SPEED)
     TIPPED_CELL_PENALTY = 25.0 # A* cost added to cells where tipping occurred (high but passable)
     TIPPED_INFLATE_RADIUS = 3  # inflate tipped area by this many cells in every direction
 
@@ -111,6 +113,7 @@ class ControleRobo(Node):
         self.robot_pitch = 0.0
         self.robot_roll = 0.0
         self._tilt_recovery_ticks = 0
+        self._post_recovery_ticks: int = 0
         self._tilt_turn_dir = 0.0   # angular velocity chosen at first detection, held during recovery
         self._tipped_cells = set()  # grid cells where tipping occurred — penalised in A*
 
@@ -148,6 +151,7 @@ class ControleRobo(Node):
         self.waypoint_idx = 0
         self._replan_ticks = 0
         self._replan_requested = False   # set when obstacle is hit; re-plan on next map update
+        self._astar_retry_ticks: int = 0
 
         # Exploration obstacle avoidance (hysteresis)
         self._explore_avoiding = False
@@ -262,10 +266,15 @@ class ControleRobo(Node):
             self._tilt_recovery_ticks -= 1
             self._publish(-self.CREEP_SPEED, self._tilt_turn_dir)
             if self._tilt_recovery_ticks == 0:
-                # Recovery just finished — re-plan from the new position so the robot
-                # doesn't follow the same waypoints back into the same obstacle
+                self._post_recovery_ticks = self.TILT_ADVANCE_TICKS
+            return
+
+        if self._post_recovery_ticks > 0:
+            self._post_recovery_ticks -= 1
+            self._publish(self.CREEP_SPEED, 0.0)
+            if self._post_recovery_ticks == 0:
                 if self.state == State.NAVIGATING_TO_FLAG and self.flag_world_pos is not None:
-                    self.get_logger().info('Tilt recovery done — re-planning path from new position')
+                    self.get_logger().info('Tilt advance done — re-planning path from new position')
                     self._plan_path_to_flag()
             return
 
@@ -332,6 +341,7 @@ class ControleRobo(Node):
             self.flag_confidence += 1
             self.get_logger().debug(f'Flag confidence: {self.flag_confidence}/{self.CONFIRM_FRAMES}')
             if self.flag_confidence >= self.CONFIRM_FRAMES:
+                self._astar_retry_ticks = 0
                 self._go_to(State.NAVIGATING_TO_FLAG)
         elif self.front_dist < self.OBSTACLE_FRONT or self._circumnavigating:
             self._circumnavigate()
@@ -400,18 +410,19 @@ class ControleRobo(Node):
             return
 
         # PRIORITY 3: no waypoints — fall back to visual servoing.
-        # Exception: if tipped cells are present, A* already failed on this approach corridor.
-        # Visual servoing would drive blindly into the same obstacle, so return to EXPLORING
-        # instead and let the robot find a different angle before re-planning.
-        if self._tipped_cells and self._astar_failed:
-            self.get_logger().warn(
-                'A* found no path with tipped cells present — clearing flag estimate and returning to EXPLORING'
-            )
-            self.flag_world_pos = None
-            self.last_flag_bearing = None
-            self._astar_failed = False
-            self._go_to(State.EXPLORING)
-            return
+        # Two distinct situations:
+        #   _astar_failed=True  → A* found no path; robot is still far; servo toward flag
+        #                         while retrying A* periodically so it can switch to planned
+        #                         navigation as soon as a path becomes available.
+        #   _astar_failed=False → waypoints were consumed normally; robot is close to the
+        #                         flag and just needs to close the final gap. Servo as-is.
+        if self._astar_failed:
+            self._astar_retry_ticks += 1
+            if self._astar_retry_ticks >= self.ASTAR_RETRY_INTERVAL:
+                self._astar_retry_ticks = 0
+                self._plan_path_to_flag()
+                if not self._astar_failed:
+                    return  # path found — follow waypoints next tick
         self._visual_servo_to_flag()
 
     def _follow_waypoints(self):
@@ -584,6 +595,7 @@ class ControleRobo(Node):
         if self._pos_ticks >= self.POSITION_MAX_TICKS:
             self.get_logger().warn('POSITION_TO_COLLECT timeout — clearing flag estimate and resuming navigation')
             self.flag_world_pos = None   # force fresh LiDAR-based re-estimation on next entry
+            self._astar_retry_ticks = 0
             self._go_to(State.NAVIGATING_TO_FLAG)
             return
 
