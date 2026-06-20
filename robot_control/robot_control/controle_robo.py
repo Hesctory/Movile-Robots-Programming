@@ -19,6 +19,8 @@ class State(Enum):
     FLAG_DETECTED = 1
     NAVIGATING_TO_FLAG = 2
     POSITION_TO_COLLECT = 3
+    GRABBING = 4
+    LIFTING = 5
 
 
 class ControleRobo(Node):
@@ -108,6 +110,13 @@ class ControleRobo(Node):
     # Open = fingers spread apart (left → +max, right → -max), arm held level.
     GRIPPER_OPEN  = (0.0, -0.06, 0.06)
     GRIPPER_CLOSE = (0.0,  0.0,  0.0)
+    # Lift: arm pitched up (gripper_extension < 0 raises it; limit -1.57) with fingers
+    # held closed. Tune the angle toward -1.57 if the flag base doesn't clear the floor.
+    GRIPPER_LIFT  = (-0.6, 0.0,  0.0)
+
+    # --- grab / lift sequence (timed, open-loop — node has no joint-state feedback) ---
+    GRAB_TICKS = 15   # ticks to let the fingers clamp before lifting (~1.5 s)
+    LIFT_TICKS = 30   # ticks to let the arm raise before declaring done (~3 s)
 
     def __init__(self):
         super().__init__('controle_robo')
@@ -201,6 +210,10 @@ class ControleRobo(Node):
         self._pos_ticks = 0          # total ticks spent in POSITION_TO_COLLECT
         self._flag_close_ticks = 0   # consecutive ticks where flag is close+aligned
 
+        # Grab / lift
+        self._grab_ticks = 0
+        self._lift_ticks = 0
+
         self.get_logger().info('ControleRobo ready — EXPLORING')
         self.state_pub.publish(String(data=self.state.name))
 
@@ -281,7 +294,12 @@ class ControleRobo(Node):
                 self._tipped_cells_age = 0
                 self.get_logger().info('Tipped cells expired — memory cleared')
 
-        if abs(self.robot_pitch) > self.TILT_THRESHOLD:
+        # Tilt recovery is suppressed during the grab/lift sequence: the robot is
+        # stationary clamping the flag, and a spurious pitch reading must not make it
+        # reverse and abandon the grab.
+        grabbing_or_lifting = self.state in (State.GRABBING, State.LIFTING)
+
+        if abs(self.robot_pitch) > self.TILT_THRESHOLD and not grabbing_or_lifting:
             if self._tilt_recovery_ticks == 0:   # first detection this event — decide direction once
                 self._tilt_turn_dir = self._tilt_turn_direction()
                 self._record_tipped_location()
@@ -315,6 +333,10 @@ class ControleRobo(Node):
             self._navigating()
         elif self.state == State.POSITION_TO_COLLECT:
             self._position_to_collect()
+        elif self.state == State.GRABBING:
+            self._grabbing()
+        elif self.state == State.LIFTING:
+            self._lifting()
 
     # ------------------------------------------------------------------
 
@@ -689,6 +711,23 @@ class ControleRobo(Node):
                 f'FLAG REACHED — distance={self.front_dist:.2f} m, '
                 f'angle_error={err:.3f} rad'
             )
+            self._go_to(State.GRABBING)
+
+    # ------------------------------------------------------------------
+
+    def _grabbing(self):
+        """Hold position and let the claw clamp the pole, then lift."""
+        self._stop()
+        self._grab_ticks += 1
+        if self._grab_ticks >= self.GRAB_TICKS:
+            self._go_to(State.LIFTING)
+
+    def _lifting(self):
+        """Hold position and raise the arm, then the task is complete."""
+        self._stop()
+        self._lift_ticks += 1
+        if self._lift_ticks >= self.LIFT_TICKS:
+            self.get_logger().info('FLAG LIFTED — task complete')
             self.timer.cancel()
 
     # ------------------------------------------------------------------
@@ -1018,6 +1057,16 @@ class ControleRobo(Node):
             # Open the claw for the final approach so it's ready to capture the flag.
             self._open_gripper()
             self.get_logger().info('Claw opened for collection')
+        elif new_state == State.GRABBING:
+            self._stop()
+            self._grab_ticks = 0
+            self._close_gripper()
+            self.get_logger().info('Closing claw on flag pole')
+        elif new_state == State.LIFTING:
+            self._stop()
+            self._lift_ticks = 0
+            self._set_gripper(self.GRIPPER_LIFT)
+            self.get_logger().info('Lifting flag')
 
 
 def main(args=None):
