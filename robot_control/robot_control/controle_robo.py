@@ -11,7 +11,7 @@ from geometry_msgs.msg import Pose, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
 from sensor_msgs.msg import Image, Imu, LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Float64MultiArray, String
 
 
 class State(Enum):
@@ -35,8 +35,11 @@ class ControleRobo(Node):
 
     # --- camera / detection ---
     FLAG_LABEL = 25
-    MIN_FLAG_PIXELS = 50
+    MIN_FLAG_PIXELS = 25       # blob area to ACQUIRE the flag (Schmitt high threshold) — sized for the thin pole (label 25); ~5 m range
+    MIN_FLAG_PIXELS_LOW = 14   # blob area below which we DROP it (Schmitt low threshold)
+    FLAG_LOST_GRACE = 3        # camera frames a dropout is tolerated before flag_visible→False
     CONFIRM_FRAMES = 5
+    FLAG_LOST_TICKS_MAX = 8    # control ticks flag must stay lost before FLAG_DETECTED→EXPLORING (~0.8 s)
     CAMERA_FOV = 1.57
     # Calibrate: drive to exactly CLOSE_ENOUGH metres from the flag and read
     # flag_pixel_height, then set FLAG_CAM_K = CLOSE_ENOUGH * pixel_height.
@@ -44,6 +47,11 @@ class ControleRobo(Node):
 
     # --- re-acquisition after losing flag ---
     SEARCH_TICKS_MAX = 60
+
+    # --- "obstacle ahead is actually the flag" guard (prevents circumnavigating our own target) ---
+    FLAG_AHEAD_ALIGN = 0.2   # |normalised bearing| within which a front blockage may be the flag pole
+    FLAG_AHEAD_MATCH = 0.4   # m — front-LiDAR vs camera-distance agreement to treat the blockage as the flag
+    FLAG_AHEAD_TICKS_MAX = 25  # ticks the front may stay "flag ahead" without collecting before we allow circumnavigation (~2.5 s)
 
     # --- alignment ---
     ANGULAR_ALIGN_THRESH = 0.05
@@ -94,12 +102,20 @@ class ControleRobo(Node):
     # --- tipped cells ---
     TIPPED_CELLS_TTL = 600    # ticks before tipped cells are forgotten (~60 s)
 
+    # --- gripper / claw ---
+    # Joint order expected by gripper_controller (JointGroupPositionController):
+    # [gripper_extension, right_gripper_joint, left_gripper_joint].
+    # Open = fingers spread apart (left → +max, right → -max), arm held level.
+    GRIPPER_OPEN  = (0.0, -0.06, 0.06)
+    GRIPPER_CLOSE = (0.0,  0.0,  0.0)
+
     def __init__(self):
         super().__init__('controle_robo')
 
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_pub = self.create_publisher(Path, '/astar_path', 10)
         self.state_pub = self.create_publisher(String, '/robot_state', 1)
+        self.gripper_pub = self.create_publisher(Float64MultiArray, '/gripper_controller/commands', 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Image, '/robot_cam/labels_map', self.camera_callback, 10)
         self.create_subscription(Pose, '/model/prm_robot/pose', self.pose_callback, 10)
@@ -138,6 +154,8 @@ class ControleRobo(Node):
         self.flag_visible = False
         self.flag_angular_error = 0.0
         self.flag_confidence = 0
+        self._flag_lost_frames = 0   # camera frames since last solid detection (debounce)
+        self._flag_lost_ticks = 0    # control ticks flag has been lost while in FLAG_DETECTED
         self.last_angular_error = 0.0
         self.last_flag_bearing = None
         self.flag_pixel_height = 0       # bounding-box height of flag in camera frame (pixels)
@@ -176,6 +194,7 @@ class ControleRobo(Node):
 
         # Re-acquisition search
         self._search_ticks = 0
+        self._flag_ahead_ticks = 0   # ticks the front blockage has been attributed to the flag
 
         # Position-to-collect
         self._done_ticks = 0
@@ -212,14 +231,24 @@ class ControleRobo(Node):
         h, w = frame.shape
         mask = (frame.astype(np.int32) == self.FLAG_LABEL)
         area = int(np.count_nonzero(mask))
-        if area >= self.MIN_FLAG_PIXELS:
+
+        # Schmitt-trigger + grace-window debounce so a single noisy frame near the
+        # threshold does not flip flag_visible (which would reset the confirmation FSM).
+        # Acquire at MIN_FLAG_PIXELS; treat as a valid frame down to MIN_FLAG_PIXELS_LOW;
+        # below that, tolerate FLAG_LOST_GRACE dropped frames before declaring loss.
+        solid = area >= self.MIN_FLAG_PIXELS or (self.flag_visible and area >= self.MIN_FLAG_PIXELS_LOW)
+        if solid:
             ys, xs = np.where(mask)
             cx = float(np.mean(xs))
+            self._flag_lost_frames = 0
             self.flag_visible = True
             self.flag_pixel_height = int(np.max(ys) - np.min(ys)) + 1
             self.flag_angular_error = (cx - w / 2.0) / w
             angular_error_rad = self.flag_angular_error * self.CAMERA_FOV
             self.last_flag_bearing = self.robot_heading - angular_error_rad
+        elif self.flag_visible and self._flag_lost_frames < self.FLAG_LOST_GRACE:
+            # Brief dropout — keep the last good bearing/height and stay "visible"
+            self._flag_lost_frames += 1
         else:
             self.flag_visible = False
             self.flag_pixel_height = 0
@@ -337,7 +366,14 @@ class ControleRobo(Node):
     def _flag_detected(self):
         if self.flag_visible:
             self._circumnavigating = False
-            self._stop()
+            self._flag_lost_ticks = 0
+            # Approach while confirming: align to the flag and creep forward so the
+            # blob grows above threshold and the detection stabilises, instead of
+            # parking at the flicker distance. Confirmation logic is unchanged.
+            err = self.flag_angular_error
+            angular = max(-self.TURN_SPEED, min(self.TURN_SPEED, -self.KP_ANGULAR_ALIGN * err))
+            linear = self.CREEP_SPEED if abs(err) < 0.1 else 0.0
+            self._publish(linear, angular)
             self.flag_confidence += 1
             self.get_logger().debug(f'Flag confidence: {self.flag_confidence}/{self.CONFIRM_FRAMES}')
             if self.flag_confidence >= self.CONFIRM_FRAMES:
@@ -346,11 +382,17 @@ class ControleRobo(Node):
         elif self.front_dist < self.OBSTACLE_FRONT or self._circumnavigating:
             self._circumnavigate()
         else:
+            # Sustained-loss guard: tolerate brief gaps (the debounce already smooths
+            # the camera) so confidence accumulated across glimpses is not thrown away
+            # on the first missed frame. Only give up after FLAG_LOST_TICKS_MAX ticks.
             self._stop()
-            self.flag_confidence = max(0, self.flag_confidence - 1)
-            self.get_logger().debug(f'Flag lost — confidence decaying: {self.flag_confidence}')
-            if self.flag_confidence == 0:
-                self._go_to(State.EXPLORING)
+            self._flag_lost_ticks += 1
+            if self._flag_lost_ticks >= self.FLAG_LOST_TICKS_MAX:
+                self.flag_confidence = max(0, self.flag_confidence - 1)
+                self._flag_lost_ticks = 0
+                self.get_logger().debug(f'Flag lost — confidence decaying: {self.flag_confidence}')
+                if self.flag_confidence == 0:
+                    self._go_to(State.EXPLORING)
 
     # ------------------------------------------------------------------
 
@@ -495,7 +537,27 @@ class ControleRobo(Node):
         if self.flag_visible:
             self._search_ticks = 0
 
-        if self.front_dist < self.OBSTACLE_FRONT or self._circumnavigating:
+        # The flag pole reads as a LiDAR obstacle once we close in. Don't circumnavigate
+        # our own target: if the flag is visible, roughly centred (so it's inside the front
+        # LiDAR sector), and the camera-derived distance agrees with the front reading, the
+        # thing ahead IS the flag — keep servoing straight so PRIORITY 1 hands off to collect.
+        # A genuine obstacle nearer than the flag reads front_dist << cam_dist and still triggers.
+        cam_dist = (self.FLAG_CAM_K / self.flag_pixel_height
+                    if self.flag_visible and self.flag_pixel_height > 0 else float('inf'))
+        flag_ahead = (self.flag_visible
+                      and abs(self.last_angular_error) < self.FLAG_AHEAD_ALIGN
+                      and abs(self.front_dist - cam_dist) < self.FLAG_AHEAD_MATCH)
+
+        # Stall watchdog: an obstacle sitting at the flag's range, beside the pole, would
+        # also satisfy flag_ahead. If we keep suppressing circumnavigation but never reach
+        # the collect handoff, something is really in the way — release the suppression.
+        if flag_ahead:
+            self._flag_ahead_ticks += 1
+        else:
+            self._flag_ahead_ticks = 0
+        stalled = self._flag_ahead_ticks > self.FLAG_AHEAD_TICKS_MAX
+
+        if (self.front_dist < self.OBSTACLE_FRONT or self._circumnavigating) and (not flag_ahead or stalled):
             self._circumnavigate()
             return
 
@@ -888,6 +950,16 @@ class ControleRobo(Node):
     def _stop(self):
         self._publish(0.0, 0.0)
 
+    def _set_gripper(self, positions):
+        """Send an absolute position command to the claw's three joints."""
+        self.gripper_pub.publish(Float64MultiArray(data=[float(p) for p in positions]))
+
+    def _open_gripper(self):
+        self._set_gripper(self.GRIPPER_OPEN)
+
+    def _close_gripper(self):
+        self._set_gripper(self.GRIPPER_CLOSE)
+
     def _go_to(self, new_state: State):
         self.get_logger().info(f'{self.state.name} → {new_state.name}')
         self.state = new_state
@@ -896,13 +968,17 @@ class ControleRobo(Node):
             self.flag_confidence = 0
             self._search_ticks = 0
         elif new_state == State.FLAG_DETECTED:
-            self.flag_confidence = 0
+            # Do NOT reset flag_confidence here: glimpses must persist across
+            # EXPLORING↔FLAG_DETECTED bounces so the confirmation vote can build.
+            # (EXPLORING entry above is the genuine "gave up" reset.)
+            self._flag_lost_ticks = 0
             self._circumnavigating = False
         elif new_state == State.NAVIGATING_TO_FLAG:
             self._search_ticks = 0
             self._circumnavigating = False
             self._replan_ticks = 0
             self._flag_close_ticks = 0
+            self._flag_ahead_ticks = 0
             self._replan_requested = False
             self.waypoints = []
             self.waypoint_idx = 0
@@ -939,6 +1015,9 @@ class ControleRobo(Node):
             self._done_ticks = 0
             self._pos_ticks = 0
             self.last_cam_dist_pos = float('inf')
+            # Open the claw for the final approach so it's ready to capture the flag.
+            self._open_gripper()
+            self.get_logger().info('Claw opened for collection')
 
 
 def main(args=None):
