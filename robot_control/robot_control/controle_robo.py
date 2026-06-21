@@ -21,6 +21,7 @@ class State(Enum):
     POSITION_TO_COLLECT = 3
     GRABBING = 4
     LIFTING = 5
+    RETURNING_TO_BASE = 6
 
 
 class ControleRobo(Node):
@@ -118,6 +119,15 @@ class ControleRobo(Node):
     GRAB_TICKS = 15   # ticks to let the fingers clamp before lifting (~1.5 s)
     LIFT_TICKS = 30   # ticks to let the arm raise before declaring done (~3 s)
 
+    # --- return to base (carrying the flag) ---
+    RETURN_SPEED = 0.10     # m/s — slower than NAV_SPEED for stability with the load
+    HOME_TOLERANCE = 0.30   # m — distance to home that counts as arrived
+    # The carried flag is rigidly held ~0.3-0.45 m ahead and crosses the 2-D LiDAR plane,
+    # so it reads as a permanent front obstacle. Any return inside this forward cone +
+    # range band is our own cargo, not the world — masked out of the scan while carrying.
+    CARGO_MASK_ANGLE = 0.7  # rad (~±40°) — forward half-cone occupied by the flag
+    CARGO_MASK_RANGE = 0.6  # m — returns closer than this in the cone are the cargo
+
     def __init__(self):
         super().__init__('controle_robo')
 
@@ -214,6 +224,10 @@ class ControleRobo(Node):
         self._grab_ticks = 0
         self._lift_ticks = 0
 
+        # Return to base
+        self.home_pos = None     # (x, y) captured from the first pose reading
+        self._carrying = False   # True once the flag is grabbed — enables cargo masking
+
         self.get_logger().info('ControleRobo ready — EXPLORING')
         self.state_pub.publish(String(data=self.state.name))
 
@@ -232,6 +246,11 @@ class ControleRobo(Node):
     def pose_callback(self, msg: Pose):
         self.robot_x = msg.position.x
         self.robot_y = msg.position.y
+        if self.home_pos is None:
+            self.home_pos = (self.robot_x, self.robot_y)
+            self.get_logger().info(
+                f'Home position recorded: ({self.robot_x:.2f}, {self.robot_y:.2f})'
+            )
         q = msg.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
@@ -278,9 +297,9 @@ class ControleRobo(Node):
         raw = np.array(msg.data, dtype=np.int8).reshape(msg.info.height, msg.info.width)
         self.grid_map = self._inflate_obstacles(raw, self.OBSTACLE_INFLATE_RADIUS)
         # If a waypoint obstacle was detected, re-plan now that the map is fresh
-        if self._replan_requested and self.flag_world_pos is not None:
+        if self._replan_requested and (self.flag_world_pos is not None or self._carrying):
             self._replan_requested = False
-            self._plan_path_to_flag()
+            self._replan_current_goal()
 
     # ------------------------------------------------------------------
     # State machine
@@ -323,6 +342,9 @@ class ControleRobo(Node):
                 if self.state == State.NAVIGATING_TO_FLAG and self.flag_world_pos is not None:
                     self.get_logger().info('Tilt advance done — re-planning path from new position')
                     self._plan_path_to_flag()
+                elif self.state == State.RETURNING_TO_BASE:
+                    self.get_logger().info('Tilt advance done — re-planning path to base from new position')
+                    self._plan_path_to_base()
             return
 
         if self.state == State.EXPLORING:
@@ -337,6 +359,8 @@ class ControleRobo(Node):
             self._grabbing()
         elif self.state == State.LIFTING:
             self._lifting()
+        elif self.state == State.RETURNING_TO_BASE:
+            self._returning_to_base()
 
     # ------------------------------------------------------------------
 
@@ -501,6 +525,12 @@ class ControleRobo(Node):
                 f'Waypoint reached — advancing to {self.waypoint_idx}/{len(self.waypoints)}'
             )
             if self.waypoint_idx >= len(self.waypoints):
+                if self.state == State.RETURNING_TO_BASE:
+                    # Arrival is decided by _returning_to_base() (HOME_TOLERANCE); if the
+                    # path ran out before we got there, re-plan to home from here.
+                    self.get_logger().info('Return waypoints consumed — re-planning to base')
+                    self._plan_path_to_base()
+                    return
                 # Sanity-check: only hand off when the flag is genuinely close.
                 # If the A* goal was placed on a wrong LiDAR hit (wall in the flag
                 # direction), waypoints end far from the real flag — re-plan instead.
@@ -550,8 +580,9 @@ class ControleRobo(Node):
             return
 
         angular = max(-self.TURN_SPEED, min(self.TURN_SPEED, self.KP_ANGULAR_WAYPOINT * heading_err))
-        # Move forward only when roughly aligned with the waypoint
-        linear = self.NAV_SPEED if abs(heading_err) < 0.3 else 0.0
+        # Move forward only when roughly aligned with the waypoint; slower under load.
+        cruise = self.RETURN_SPEED if self.state == State.RETURNING_TO_BASE else self.NAV_SPEED
+        linear = cruise if abs(heading_err) < 0.3 else 0.0
         self._publish(linear, angular)
 
     def _visual_servo_to_flag(self):
@@ -727,8 +758,69 @@ class ControleRobo(Node):
         self._stop()
         self._lift_ticks += 1
         if self._lift_ticks >= self.LIFT_TICKS:
-            self.get_logger().info('FLAG LIFTED — task complete')
+            self.get_logger().info('FLAG LIFTED — returning to base')
+            self._go_to(State.RETURNING_TO_BASE)
+
+    # ------------------------------------------------------------------
+
+    def _returning_to_base(self):
+        """Drive the explored map back to the recorded home position, carrying the flag.
+
+        Mirrors _navigating() but the goal is home and there is no camera servoing.
+        The carried flag is masked out of the LiDAR (see _sector_min), so A* is the
+        primary navigator and the front sector reflects real obstacles only.
+        """
+        if self.home_pos is None:
+            self._stop()
+            return
+
+        hx, hy = self.home_pos
+        dist_home = math.hypot(hx - self.robot_x, hy - self.robot_y)
+
+        # PRIORITY 1: arrived home
+        if dist_home < self.HOME_TOLERANCE:
+            self._stop()
+            self.get_logger().info(
+                f'BASE REACHED — flag delivered at ({self.robot_x:.2f}, {self.robot_y:.2f})'
+            )
             self.timer.cancel()
+            return
+
+        # PRIORITY 2: follow A* waypoints, re-planning periodically
+        if self.waypoints and self.waypoint_idx < len(self.waypoints):
+            self._replan_ticks += 1
+            if self._replan_ticks >= self.REPLAN_INTERVAL:
+                self._replan_ticks = 0
+                self.get_logger().info('Periodic re-plan (return) triggered')
+                self._plan_path_to_base()
+                if not self.waypoints:
+                    return
+            self._follow_waypoints()
+            return
+
+        # PRIORITY 3: no path — retry A* periodically while creeping toward home.
+        if self._astar_failed:
+            self._astar_retry_ticks += 1
+            if self._astar_retry_ticks >= self.ASTAR_RETRY_INTERVAL:
+                self._astar_retry_ticks = 0
+                self._plan_path_to_base()
+                if not self._astar_failed:
+                    return  # path found — follow it next tick
+        self._reactive_to_home(hx, hy)
+
+    def _reactive_to_home(self, hx: float, hy: float):
+        """Fallback used only when A* has no path: head toward home, masked-LiDAR avoidance."""
+        # Obstacle ahead (cargo already masked): turn toward the more open side.
+        if self.front_dist < self.OBSTACLE_FRONT:
+            turn_dir = 1.0 if self.front_left_dist >= self.front_right_dist else -1.0
+            self._publish(0.0, turn_dir * self.TURN_SPEED)
+            return
+
+        bearing_home = math.atan2(hy - self.robot_y, hx - self.robot_x)
+        heading_err = self._angle_diff(bearing_home, self.robot_heading)
+        angular = max(-self.TURN_SPEED, min(self.TURN_SPEED, self.KP_ANGULAR_WAYPOINT * heading_err))
+        linear = self.RETURN_SPEED if abs(heading_err) < 0.3 else 0.0
+        self._publish(linear, angular)
 
     # ------------------------------------------------------------------
     # A* path planning
@@ -737,9 +829,6 @@ class ControleRobo(Node):
     def _plan_path_to_flag(self):
         if self.grid_map is None or self.flag_world_pos is None:
             return
-
-        start = self._world_to_grid(self.robot_x, self.robot_y)
-
 
         # Place the A* goal CLOSE_ENOUGH metres in front of the flag (toward the
         # robot), not on the flag pole itself.  The flag pole is marked as an
@@ -756,9 +845,33 @@ class ControleRobo(Node):
             f'A* goal set to ({goal_wx:.2f}, {goal_wy:.2f}) — {self.CLOSE_ENOUGH} m '
             f'in front of flag at ({flag_x:.2f}, {flag_y:.2f})'
         )
+        self._plan_path_to(goal)
 
-        # Safety net: if the offset goal cell is still blocked (e.g. the flag is
-        # near a wall and the free space in front is also occupied), search outward
+    def _plan_path_to_base(self):
+        if self.grid_map is None or self.home_pos is None:
+            return
+        goal = self._world_to_grid(*self.home_pos)
+        self.get_logger().debug(
+            f'A* goal set to home ({self.home_pos[0]:.2f}, {self.home_pos[1]:.2f})'
+        )
+        self._plan_path_to(goal)
+
+    def _replan_current_goal(self):
+        """Re-plan to whichever goal the current state is pursuing."""
+        if self.state == State.RETURNING_TO_BASE:
+            self._plan_path_to_base()
+        else:
+            self._plan_path_to_flag()
+
+    def _plan_path_to(self, goal: tuple):
+        """Plan an A* path from the robot's cell to grid cell `goal` and publish it."""
+        if self.grid_map is None:
+            return
+
+        start = self._world_to_grid(self.robot_x, self.robot_y)
+
+        # Safety net: if the goal cell is blocked (e.g. it sits in an inflation zone or
+        # on an obstacle), search outward for the nearest free cell.
         g_gx, g_gy = goal
         if self._grid_in_bounds(g_gx, g_gy) and self.grid_map[g_gy, g_gx] == 100:
             found = False
@@ -971,6 +1084,9 @@ class ControleRobo(Node):
                 continue
             a = msg.angle_min + i * msg.angle_increment
             a = (a + math.pi) % (2 * math.pi) - math.pi
+            # Mask the carried flag: forward cone, short range — it's our cargo, not the world.
+            if self._carrying and abs(a) < self.CARGO_MASK_ANGLE and r < self.CARGO_MASK_RANGE:
+                continue
             if start <= a <= end:
                 vals.append(r)
         return min(vals) if vals else float('inf')
@@ -1060,6 +1176,7 @@ class ControleRobo(Node):
         elif new_state == State.GRABBING:
             self._stop()
             self._grab_ticks = 0
+            self._carrying = True   # cargo masking active from here on
             self._close_gripper()
             self.get_logger().info('Closing claw on flag pole')
         elif new_state == State.LIFTING:
@@ -1067,6 +1184,17 @@ class ControleRobo(Node):
             self._lift_ticks = 0
             self._set_gripper(self.GRIPPER_LIFT)
             self.get_logger().info('Lifting flag')
+        elif new_state == State.RETURNING_TO_BASE:
+            self._carrying = True
+            self._circumnavigating = False
+            self._replan_ticks = 0
+            self._replan_requested = False
+            self._astar_failed = False
+            self._astar_retry_ticks = 0
+            self.waypoints = []
+            self.waypoint_idx = 0
+            self.get_logger().info('Returning to base with flag')
+            self._plan_path_to_base()
 
 
 def main(args=None):
