@@ -21,14 +21,22 @@ src/
 ## Pacotes da equipe
 
 ### `robot_control`
-Controle autônomo do robô com máquina de estados:
-- **EXPLORING** — spin inicial, avanço com desvio de obstáculos (histerese) e perseguição do último rumo conhecido da bandeira
-- **FLAG_DETECTED** — confirmação de detecção da bandeira pela câmera
-- **NAVIGATING_TO_FLAG** — planejamento de caminho A* até a bandeira
-- **POSITION_TO_COLLECT** — aproximação fina para coleta
+Controle autônomo do robô com máquina de estados completa de captura e retorno da bandeira:
+
+- **EXPLORING** — spin inicial, avanço com desvio de obstáculos por histerese e perseguição do último rumo conhecido da bandeira
+- **FLAG_DETECTED** — confirmação da detecção via câmera com Schmitt-trigger e janela de graça para debounce; creep lento em direção à bandeira enquanto acumula votos de confirmação
+- **NAVIGATING_TO_FLAG** — planejamento de caminho A* até a bandeira, com guarda para não circunavegar o próprio alvo quando o obstáculo à frente é o mastro
+- **POSITION_TO_COLLECT** — aproximação fina por visual servoing; abre a garra na entrada do estado
+- **GRABBING** — para o robô e fecha a garra em torno do mastro (open-loop temporizado, ~1,5 s)
+- **LIFTING** — levanta o braço com a garra fechada (~3 s)
+- **RETURNING_TO_BASE** — navega de volta à posição inicial registrada no arranque, usando A* com re-planejamento periódico; retornos LiDAR do próprio cargo são mascarados para não confundir o planejador
+
+Recursos adicionais:
+- **Recuperação de tombamento** — detecta inclinação excessiva via IMU, recua, registra células de risco com penalidade no custo A* e avança para sair; suprimida durante GRABBING e LIFTING
+- **Re-aquisição após perda da bandeira** — spin de busca de até ~6 s antes de voltar a EXPLORING
 
 Tópicos consumidos: `/scan`, `/robot_cam/labels_map`, `/model/prm_robot/pose`, `/grid_map`, `/imu`  
-Tópicos publicados: `/cmd_vel`, `/astar_path`, `/robot_state`
+Tópicos publicados: `/cmd_vel`, `/astar_path`, `/robot_state`, `/gripper_controller/commands`
 
 ### `robot_mapper`
 Mapeamento incremental via grade de ocupação 2D usando ray casting (Bresenham). Não possui launch file próprio — é iniciado pelo `robot_controller.launch.py` do `robot_control`.
