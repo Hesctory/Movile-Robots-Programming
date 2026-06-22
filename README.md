@@ -15,7 +15,11 @@ src/
 │   └── launch/
 │       └── robot_controller.launch.py  # Inicia os nós da equipe
 │
-└── robot_mapper/        # Nó de mapeamento por grade de ocupação
+├── robot_mapper/        # Nó de mapeamento por grade de ocupação
+│
+├── empty_arena.sdf      # ┐ Mundos corrigidos (rótulo da bandeira no mastro)
+├── arena_cilindros.sdf  # ├ que substituem os originais em prm_2026/world/
+└── arena_paredes.sdf    # ┘ (ver "Instalação")
 ```
 
 ## Pacotes da equipe
@@ -58,9 +62,16 @@ git clone https://github.com/matheusbg8/prm_2026.git
 # Clonar este repositório
 git clone https://github.com/Hesctory/Movile-Robots-Programming.git
 
-# Mover os pacotes da equipe para src/ e remover a pasta clonada
+# Mover os pacotes da equipe para src/
 mv Movile-Robots-Programming/robot_control .
 mv Movile-Robots-Programming/robot_mapper .
+
+# Substituir os mundos do prm_2026 pelas versões corrigidas (ver nota abaixo)
+cp Movile-Robots-Programming/empty_arena.sdf    prm_2026/world/empty_arena.sdf
+cp Movile-Robots-Programming/arena_cilindros.sdf prm_2026/world/arena_cilindros.sdf
+cp Movile-Robots-Programming/arena_paredes.sdf  prm_2026/world/arena_paredes.sdf
+
+# Remover a pasta clonada
 rm -rf Movile-Robots-Programming
 ```
 
@@ -69,6 +80,13 @@ O pacote `prm_2026` inclui um nó `robo_mapper.py` que conflita com o `robot_map
 ```bash
 rm ~/ros2_ws/src/prm_2026/prm_2026/robo_mapper.py
 ```
+
+> ⚠️ **Sobre a substituição dos mundos (passo obrigatório, já incluído acima).**
+> Sem ela, a captura da bandeira (agarrar, levantar e retornar) não funciona.
+>
+> Os mundos originais do `prm_2026` colocam o plugin de rótulo (`Label`) no nível do `<model>` da bandeira, o que rotula a bandeira inteira (mastro + painel) com o mesmo rótulo. A detecção visual do `robot_control` está calibrada para o **mastro fino** (rótulo 20 = vermelho, 25 = azul): o rótulo precisa estar no `<visual name="pole_visual">`, dando cores distintas ao mastro e ao painel na câmera de segmentação.
+>
+> Por isso este repositório traz, na raiz, cópias corrigidas de `empty_arena.sdf`, `arena_cilindros.sdf` e `arena_paredes.sdf`, que substituem as versões originais em `prm_2026/world/` (feito no passo de clonagem acima).
 
 Compile e configure o ambiente:
 
