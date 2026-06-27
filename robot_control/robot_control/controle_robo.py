@@ -26,13 +26,26 @@ class State(Enum):
 
 class ControleRobo(Node):
 
+    # --- control loop ---
+    # Single source of truth for the timer period. All tick-based durations below
+    # are derived from seconds via this value, so the loop rate can be changed here
+    # without altering any real-world timing. Raised to 20 Hz for racing: halves the
+    # per-tick travel distance, tightening obstacle reaction at the higher speeds.
+    CONTROL_PERIOD = 0.05   # seconds (20 Hz)
+
     # --- grid (must match robot_mapper constants) ---
     GRID_SIZE = 100
     GRID_RESOLUTION = 0.2
     OBSTACLE_INFLATE_RADIUS = 1   # cells of safety margin around obstacles
 
     # --- distances (metres) ---
-    OBSTACLE_FRONT = 0.6
+    OBSTACLE_FRONT = 0.6   # raised for racing: brake/avoid earlier at higher speed (open-space reaction)
+    # Block-check distance while FOLLOWING an A* path. A* only inflates obstacles by
+    # OBSTACLE_INFLATE_RADIUS (1 cell = 0.2 m), so a valid planned path legitimately threads
+    # pillar gaps ~0.35 m from each pillar. Using the full 0.8 m OBSTACLE_FRONT here would
+    # reject A*'s own corridors and deadlock (turn-away → re-plan → identical path). This
+    # smaller value only flags an obstacle CLOSER than A* planned for — a genuine surprise.
+    PATH_BLOCKED_DIST = 0.5
     CLOSE_ENOUGH = 0.7
     TARGET_DIST = 0.3
 
@@ -42,49 +55,55 @@ class ControleRobo(Node):
     MIN_FLAG_PIXELS_LOW = 14   # blob area below which we DROP it (Schmitt low threshold)
     FLAG_LOST_GRACE = 3        # camera frames a dropout is tolerated before flag_visible→False
     CONFIRM_FRAMES = 5
-    FLAG_LOST_TICKS_MAX = 8    # control ticks flag must stay lost before FLAG_DETECTED→EXPLORING (~0.8 s)
+    FLAG_LOST_TICKS_MAX = int(0.8 / CONTROL_PERIOD)    # control ticks flag must stay lost before FLAG_DETECTED→EXPLORING (~0.8 s)
     CAMERA_FOV = 1.57
     # Calibrate: drive to exactly CLOSE_ENOUGH metres from the flag and read
     # flag_pixel_height, then set FLAG_CAM_K = CLOSE_ENOUGH * pixel_height.
     FLAG_CAM_K = 84.0   # pixel_height × distance (m) — tune in simulation
 
     # --- re-acquisition after losing flag ---
-    SEARCH_TICKS_MAX = 60
+    SEARCH_TICKS_MAX = int(6.0 / CONTROL_PERIOD)   # ~6 s of re-acquisition search
 
     # --- "obstacle ahead is actually the flag" guard (prevents circumnavigating our own target) ---
     FLAG_AHEAD_ALIGN = 0.2   # |normalised bearing| within which a front blockage may be the flag pole
     FLAG_AHEAD_MATCH = 0.4   # m — front-LiDAR vs camera-distance agreement to treat the blockage as the flag
-    FLAG_AHEAD_TICKS_MAX = 25  # ticks the front may stay "flag ahead" without collecting before we allow circumnavigation (~2.5 s)
+    FLAG_AHEAD_TICKS_MAX = int(2.5 / CONTROL_PERIOD)  # ticks the front may stay "flag ahead" without collecting before we allow circumnavigation (~2.5 s)
 
     # --- alignment ---
     ANGULAR_ALIGN_THRESH = 0.05
     DIST_TOLERANCE = 0.05
-    DONE_TICKS = 10
+    DONE_TICKS = int(1.0 / CONTROL_PERIOD)   # ~1 s held aligned to declare "done"
 
     # --- waypoint following ---
-    WAYPOINT_TOLERANCE = 0.20   # metres — distance to consider a waypoint reached
+    WAYPOINT_TOLERANCE = 0.25   # metres — distance to consider a waypoint reached (raised for racing)
     WAYPOINT_STRIDE = 2         # keep every Nth cell from A* path
-    REPLAN_INTERVAL = 50        # ticks between periodic re-plans (~5 s)
-    ASTAR_RETRY_INTERVAL = 20   # ticks — retry A* every 2 s when it previously failed
+    REPLAN_INTERVAL = int(5.0 / CONTROL_PERIOD)        # ticks between periodic re-plans (~5 s)
+    ASTAR_RETRY_INTERVAL = int(2.0 / CONTROL_PERIOD)   # ticks — retry A* every 2 s when it previously failed
 
     # --- POSITION_TO_COLLECT guards ---
-    FLAG_CLOSE_CONFIRM = 4      # consecutive ticks flag must be close+aligned before switching
-    POSITION_MAX_TICKS = 200    # max ticks in POSITION_TO_COLLECT before escaping (~20 s)
+    FLAG_CLOSE_CONFIRM = int(0.4 / CONTROL_PERIOD)      # consecutive ticks flag must be close+aligned before switching (~0.4 s)
+    POSITION_MAX_TICKS = int(20.0 / CONTROL_PERIOD)    # max ticks in POSITION_TO_COLLECT before escaping (~20 s)
 
     # --- tilt recovery ---
+    # Recovery speeds are deliberately DECOUPLED from the racing speeds below: this is an
+    # open-loop manoeuvre (fixed-time reverse + spin), so scaling it with TURN_SPEED/
+    # CREEP_SPEED would over-rotate the robot and swing it back into the same obstacle.
+    # Keep these at the gentle values the recovery was originally tuned for.
+    RECOVERY_TURN_SPEED = 0.4     # rad/s — spin rate while backing away from the obstacle
+    RECOVERY_REVERSE_SPEED = 0.06 # m/s — reverse (and forward-advance) speed during recovery
     TILT_THRESHOLD = 0.25      # radians (~14°) — back up if pitched beyond this
     TILT_LIDAR_CLOSE = 0.8     # metres — LiDAR side reading below this counts as "seeing" the cause
     TILT_ROLL_THRESH = 0.10    # radians — minimum roll to trust as IMU direction signal
-    RECOVERY_TICKS = 25        # ticks to keep reversing after tilt clears (~2.5 s)
-    TILT_ADVANCE_TICKS = 17    # ticks of forward creep after tilt recovery (~0.1 m at CREEP_SPEED)
+    RECOVERY_TICKS = int(2.5 / CONTROL_PERIOD)        # ticks to keep reversing after tilt clears (~2.5 s)
+    TILT_ADVANCE_TICKS = int(0.1 / (RECOVERY_REVERSE_SPEED * CONTROL_PERIOD))  # ticks of forward creep after tilt recovery (~0.1 m)
     TIPPED_CELL_PENALTY = 25.0 # A* cost added to cells where tipping occurred (high but passable)
     TIPPED_INFLATE_RADIUS = 3  # inflate tipped area by this many cells in every direction
 
-    # --- speeds ---
-    EXPLORE_SPEED = 0.25
-    NAV_SPEED = 0.12
-    CREEP_SPEED = 0.06
-    TURN_SPEED = 0.4
+    # --- speeds (raised for racing) ---
+    EXPLORE_SPEED = 0.40
+    NAV_SPEED = 0.25
+    CREEP_SPEED = 0.10
+    TURN_SPEED = 0.6
     ALIGN_SPEED = 0.5
 
     # --- gains ---
@@ -93,17 +112,17 @@ class ControleRobo(Node):
     KP_ANGULAR_WAYPOINT = 2.0
 
     # --- exploration ---
-    SPIN_TICKS = int(2 * math.pi / (TURN_SPEED * 0.1)) + 5
-    OBSTACLE_CLEAR = 0.8   # hysteresis: stop avoiding only when front opens to this distance
+    SPIN_TICKS = int(2 * math.pi / (TURN_SPEED * CONTROL_PERIOD)) + 5
+    OBSTACLE_CLEAR = 1.0   # hysteresis: stop avoiding only when front opens to this distance (raised with OBSTACLE_FRONT)
 
     # --- circumnavigation ---
     CIRCUM_WALL_DIST = 0.45   # target gap to keep from the wall (m)
     CIRCUM_KP        = 1.8    # P-gain for wall-distance controller
-    CIRCUM_MIN_TICKS = 15     # minimum ticks before exit is allowed (~1.5 s)
-    CIRCUM_MAX_TICKS = 300    # timeout before aborting (~30 s)
+    CIRCUM_MIN_TICKS = int(1.5 / CONTROL_PERIOD)     # minimum ticks before exit is allowed (~1.5 s)
+    CIRCUM_MAX_TICKS = int(30.0 / CONTROL_PERIOD)    # timeout before aborting (~30 s)
 
     # --- tipped cells ---
-    TIPPED_CELLS_TTL = 600    # ticks before tipped cells are forgotten (~60 s)
+    TIPPED_CELLS_TTL = int(60.0 / CONTROL_PERIOD)    # ticks before tipped cells are forgotten (~60 s)
 
     # --- gripper / claw ---
     # Joint order expected by gripper_controller (JointGroupPositionController):
@@ -116,12 +135,16 @@ class ControleRobo(Node):
     GRIPPER_LIFT  = (-0.6, 0.0,  0.0)
 
     # --- grab / lift sequence (timed, open-loop — node has no joint-state feedback) ---
-    GRAB_TICKS = 15   # ticks to let the fingers clamp before lifting (~1.5 s)
-    LIFT_TICKS = 30   # ticks to let the arm raise before declaring done (~3 s)
+    GRAB_TICKS = int(1.5 / CONTROL_PERIOD)   # ticks to let the fingers clamp before lifting (~1.5 s)
+    LIFT_TICKS = int(3.0 / CONTROL_PERIOD)   # ticks to let the arm raise before declaring done (~3 s)
 
     # --- return to base (carrying the flag) ---
-    RETURN_SPEED = 0.10     # m/s — slower than NAV_SPEED for stability with the load
+    RETURN_SPEED = 0.20     # m/s — kept below NAV_SPEED for stability with the load
     HOME_TOLERANCE = 0.30   # m — distance to home that counts as arrived
+    FINAL_APPROACH_DIST = 0.7  # m — within this of home, abandon A*/obstacle-turn and creep straight in
+    #   (home sits against the arena wall, so its grid cell is inside wall inflation: A* keeps
+    #    returning a blocked/trivial path and the obstacle-turn recoils from the wall — an endless
+    #    loop. The final-approach branch docks the robot the way POSITION_TO_COLLECT docks the flag.)
     # The carried flag is rigidly held ~0.3-0.45 m ahead and crosses the 2-D LiDAR plane,
     # so it reads as a permanent front obstacle. Any return inside this forward cone +
     # range band is our own cargo, not the world — masked out of the scan while carrying.
@@ -142,7 +165,7 @@ class ControleRobo(Node):
         self.create_subscription(Imu, '/imu', self._imu_callback, 10)
 
         self.bridge = CvBridge()
-        self.timer = self.create_timer(0.1, self.move_robot)
+        self.timer = self.create_timer(self.CONTROL_PERIOD, self.move_robot)
 
         # Tilt recovery
         self.robot_pitch = 0.0
@@ -330,14 +353,14 @@ class ControleRobo(Node):
             self._tilt_recovery_ticks = self.RECOVERY_TICKS   # keep resetting while still tilted
         if self._tilt_recovery_ticks > 0:
             self._tilt_recovery_ticks -= 1
-            self._publish(-self.CREEP_SPEED, self._tilt_turn_dir)
+            self._publish(-self.RECOVERY_REVERSE_SPEED, self._tilt_turn_dir)
             if self._tilt_recovery_ticks == 0:
                 self._post_recovery_ticks = self.TILT_ADVANCE_TICKS
             return
 
         if self._post_recovery_ticks > 0:
             self._post_recovery_ticks -= 1
-            self._publish(self.CREEP_SPEED, 0.0)
+            self._publish(self.RECOVERY_REVERSE_SPEED, 0.0)
             if self._post_recovery_ticks == 0:
                 if self.state == State.NAVIGATING_TO_FLAG and self.flag_world_pos is not None:
                     self.get_logger().info('Tilt advance done — re-planning path from new position')
@@ -570,9 +593,10 @@ class ControleRobo(Node):
         target_bearing = math.atan2(dy, dx)
         heading_err = self._angle_diff(target_bearing, self.robot_heading)
 
-        # Obstacle in the direction we are heading: request a re-plan on the next
-        # map update so the grid is guaranteed to include this new obstacle.
-        if self.front_dist < self.OBSTACLE_FRONT and abs(heading_err) < 0.5:
+        # Obstacle CLOSER than A* planned for in the direction we are heading: request a
+        # re-plan on the next map update. Uses PATH_BLOCKED_DIST (not OBSTACLE_FRONT) so we
+        # don't reject A*'s own pillar-threading corridors — see PATH_BLOCKED_DIST note.
+        if self.front_dist < self.PATH_BLOCKED_DIST and abs(heading_err) < 0.5:
             self.get_logger().info('Obstacle on waypoint path — turning toward free space while waiting for re-plan')
             self._replan_requested = True
             turn_dir = 1.0 if self.front_left_dist >= self.front_right_dist else -1.0
@@ -777,13 +801,29 @@ class ControleRobo(Node):
         hx, hy = self.home_pos
         dist_home = math.hypot(hx - self.robot_x, hy - self.robot_y)
 
-        # PRIORITY 1: arrived home
+        # PRIORITY 1: arrived home — stop, drop the flag, end the mission.
         if dist_home < self.HOME_TOLERANCE:
             self._stop()
+            self._open_gripper()        # release the flag at the base
+            self._carrying = False      # flag delivered — disable cargo masking
             self.get_logger().info(
                 f'BASE REACHED — flag delivered at ({self.robot_x:.2f}, {self.robot_y:.2f})'
             )
             self.timer.cancel()
+            return
+
+        # PRIORITY 1.5: final approach. Close to home the goal cell is usually inside wall
+        # inflation, so A* returns a blocked/trivial path and _follow_waypoints recoils from
+        # the base wall forever. Within FINAL_APPROACH_DIST, bypass A* and obstacle avoidance:
+        # align to home and creep straight in until HOME_TOLERANCE (accepting the nearby wall,
+        # exactly as the flag approach accepts the flag pole as the target, not an obstacle).
+        if dist_home < self.FINAL_APPROACH_DIST:
+            self.waypoints = []   # abandon the stale/blocked path
+            bearing_home = math.atan2(hy - self.robot_y, hx - self.robot_x)
+            heading_err = self._angle_diff(bearing_home, self.robot_heading)
+            angular = max(-self.TURN_SPEED, min(self.TURN_SPEED, self.KP_ANGULAR_WAYPOINT * heading_err))
+            linear = self.CREEP_SPEED if abs(heading_err) < 0.3 else 0.0
+            self._publish(linear, angular)
             return
 
         # PRIORITY 2: follow A* waypoints, re-planning periodically
@@ -958,18 +998,18 @@ class ControleRobo(Node):
         if left < self.TILT_LIDAR_CLOSE or right < self.TILT_LIDAR_CLOSE:
             direction = 1 if right < left else -1   # turn away from the closer side
             self.get_logger().info('Tilt direction: LiDAR')
-            return direction * self.TURN_SPEED
+            return direction * self.RECOVERY_TURN_SPEED
 
         # Tier 2: IMU roll — positive roll = leaning right (ROS: X-fwd, Y-left, Z-up)
         # → obstacle likely on right → turn left; flip sign if robot uses a different frame
         if abs(self.robot_roll) > self.TILT_ROLL_THRESH:
             direction = 1 if self.robot_roll > 0 else -1
             self.get_logger().info('Tilt direction: IMU roll')
-            return direction * self.TURN_SPEED
+            return direction * self.RECOVERY_TURN_SPEED
 
         # Tier 3: nothing visible and no clear lean — random escape
         self.get_logger().info('Tilt direction: random')
-        return random.choice([-1, 1]) * self.TURN_SPEED
+        return random.choice([-1, 1]) * self.RECOVERY_TURN_SPEED
 
     def _astar(self, start: tuple, goal: tuple) -> list:
         """Returns a list of (gx, gy) grid cells from start to goal, or [] if no path found."""

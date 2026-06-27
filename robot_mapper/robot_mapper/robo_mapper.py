@@ -7,7 +7,7 @@ from geometry_msgs.msg import Pose, TransformStamped
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from tf2_ros import StaticTransformBroadcaster
 
 
@@ -17,11 +17,18 @@ class RoboMapper(Node):
     GRID_SIZE = 100     # cells
     RESOLUTION = 0.2    # metres per cell
 
+    # Carried-flag masking (must match the controller's _sector_min mask). The grabbed
+    # flag is rigidly held in a short forward cone and crosses the 2-D LiDAR plane, so
+    # its returns must not be mapped as a wall that follows the robot.
+    CARGO_MASK_ANGLE = 0.7   # rad (~±40°) — forward half-cone occupied by the flag
+    CARGO_MASK_RANGE = 0.6   # m — returns closer than this in the cone are the cargo
+
     def __init__(self):
         super().__init__('robo_mapper')
 
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Pose, '/model/prm_robot/pose', self.odom_callback, 10)
+        self.create_subscription(String, '/robot_state', self.state_callback, 10)
 
         self.map_pub = self.create_publisher(OccupancyGrid, '/grid_map', 10)
         self.timer = self.create_timer(0.5, self.publish_occupancy_grid)
@@ -30,6 +37,9 @@ class RoboMapper(Node):
         self.x = 0.0
         self.y = 0.0
         self.heading = 0.0
+
+        # True while the flag is grabbed and held — enables cargo masking below.
+        self.carrying = False
 
         # -1 = unknown, 0 = free, 100 = occupied
         self.grid_map = -np.ones((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
@@ -46,6 +56,10 @@ class RoboMapper(Node):
     # ------------------------------------------------------------------
     # Sensor callbacks
     # ------------------------------------------------------------------
+
+    def state_callback(self, msg: String):
+        # The flag is clamped from GRABBING onward and held until base is reached.
+        self.carrying = msg.data in ('GRABBING', 'LIFTING', 'RETURNING_TO_BASE')
 
     def odom_callback(self, msg: Pose):
         self.x = msg.position.x
@@ -65,7 +79,13 @@ class RoboMapper(Node):
         angle = msg.angle_min
         for r in msg.ranges:
             in_range = math.isfinite(r) and msg.range_min < r < msg.range_max
-            if in_range:
+            # Skip the carried flag: a return in the short forward cone is our cargo, not
+            # the world (beam angle is already robot-relative; 0 = straight ahead).
+            beam = (angle + math.pi) % (2 * math.pi) - math.pi
+            cargo = (self.carrying
+                     and abs(beam) < self.CARGO_MASK_ANGLE
+                     and r < self.CARGO_MASK_RANGE)
+            if in_range and not cargo:
                 world_angle = self.heading + angle
                 ex = self.x + r * math.cos(world_angle)
                 ey = self.y + r * math.sin(world_angle)
