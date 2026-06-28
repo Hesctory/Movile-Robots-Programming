@@ -23,6 +23,18 @@ class RoboMapper(Node):
     CARGO_MASK_ANGLE = 0.7   # rad (~±40°) — forward half-cone occupied by the flag
     CARGO_MASK_RANGE = 0.6   # m — returns closer than this in the cone are the cargo
 
+    # --- log-odds occupancy model (hit/miss with active free-space clearing) ---
+    # The grid is accumulated as log-odds, not a single sticky write, so (a) single spurious
+    # returns no longer stick as permanent obstacles, and (b) free space is actively cleared.
+    # Crucially, a beam that returns NOTHING clears free out to max range — this is what finally
+    # maps the wide open zones the 3.5 m LiDAR can't bounce a return across.
+    L_OCC  = 0.7      # log-odds added to a hit (endpoint) cell
+    L_FREE = -0.4     # log-odds added to each cell a beam passes through / clears
+    L_MIN  = -2.0     # clamp range — keeps cells correctable (recovers from error/dynamic objects)
+    L_MAX  = 3.0
+    OCC_THRESH  = 1.0   # log-odds > this ⇒ published occupied (needs ~2 consistent hits)
+    FREE_THRESH = -0.7  # log-odds < this ⇒ published free     (needs ~2 consistent clears)
+
     def __init__(self):
         super().__init__('robo_mapper')
 
@@ -41,8 +53,9 @@ class RoboMapper(Node):
         # True while the flag is grabbed and held — enables cargo masking below.
         self.carrying = False
 
-        # -1 = unknown, 0 = free, 100 = occupied
-        self.grid_map = -np.ones((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
+        # Log-odds occupancy (0.0 = unknown). The published -1/0/100 grid is thresholded
+        # from this each publish cycle.
+        self.logodds = np.zeros((self.GRID_SIZE, self.GRID_SIZE), dtype=np.float32)
 
         # Broadcast static map → odom_gt transform so RViz can display the grid
         self.tf_static = StaticTransformBroadcaster(self)
@@ -78,19 +91,22 @@ class RoboMapper(Node):
 
         angle = msg.angle_min
         for r in msg.ranges:
-            in_range = math.isfinite(r) and msg.range_min < r < msg.range_max
-            # Skip the carried flag: a return in the short forward cone is our cargo, not
-            # the world (beam angle is already robot-relative; 0 = straight ahead).
             beam = (angle + math.pi) % (2 * math.pi) - math.pi
+            # Skip the carried flag entirely: a finite return in the short forward cone is
+            # our cargo, not the world — don't let it clear OR mark anything.
             cargo = (self.carrying
                      and abs(beam) < self.CARGO_MASK_ANGLE
-                     and r < self.CARGO_MASK_RANGE)
-            if in_range and not cargo:
+                     and math.isfinite(r) and r < self.CARGO_MASK_RANGE)
+            if not cargo:
                 world_angle = self.heading + angle
-                ex = self.x + r * math.cos(world_angle)
-                ey = self.y + r * math.sin(world_angle)
+                hit = math.isfinite(r) and msg.range_min < r < msg.range_max
+                # No return ⇒ nothing within max range this way: clear free out to max range
+                # (no occupied endpoint). This is what finally fills the wide open zones.
+                rng = r if hit else msg.range_max
+                ex = self.x + rng * math.cos(world_angle)
+                ey = self.y + rng * math.sin(world_angle)
                 end_gx, end_gy = self.world_to_grid(ex, ey)
-                self._bresenham(robot_gx, robot_gy, end_gx, end_gy, mark_end=True)
+                self._ray_update(robot_gx, robot_gy, end_gx, end_gy, occupied_end=hit)
             angle += msg.angle_increment
 
     # ------------------------------------------------------------------
@@ -113,7 +129,11 @@ class RoboMapper(Node):
         origin.orientation.w = 1.0
         msg.info.origin = origin
 
-        msg.data = self.grid_map.flatten().tolist()
+        # Threshold log-odds into the ROS occupancy convention (-1 unknown / 0 free / 100 occ).
+        grid = np.full((self.GRID_SIZE, self.GRID_SIZE), -1, dtype=np.int8)
+        grid[self.logodds > self.OCC_THRESH] = 100
+        grid[self.logodds < self.FREE_THRESH] = 0
+        msg.data = grid.flatten().tolist()
         self.map_pub.publish(msg)
 
     # ------------------------------------------------------------------
@@ -129,8 +149,14 @@ class RoboMapper(Node):
     def _in_bounds(self, gx: int, gy: int) -> bool:
         return 0 <= gx < self.GRID_SIZE and 0 <= gy < self.GRID_SIZE
 
-    def _bresenham(self, x0: int, y0: int, x1: int, y1: int, mark_end: bool):
-        """Walk cells from (x0,y0) to (x1,y1), marking free; optionally mark end occupied."""
+    def _bump(self, gx: int, gy: int, delta: float):
+        """Add to a cell's log-odds, clamped to [L_MIN, L_MAX]."""
+        v = self.logodds[gy, gx] + delta
+        self.logodds[gy, gx] = min(self.L_MAX, max(self.L_MIN, v))
+
+    def _ray_update(self, x0: int, y0: int, x1: int, y1: int, occupied_end: bool):
+        """Bresenham from robot (x0,y0) to endpoint (x1,y1): clear every cell the beam
+        passes through with L_FREE; if occupied_end, mark the endpoint a hit with L_OCC."""
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
         sx = 1 if x1 > x0 else -1
@@ -141,10 +167,10 @@ class RoboMapper(Node):
             at_end = (x0 == x1 and y0 == y1)
 
             if self._in_bounds(x0, y0):
-                if at_end and mark_end:
-                    self.grid_map[y0, x0] = 100
-                elif not at_end and self.grid_map[y0, x0] != 100:
-                    self.grid_map[y0, x0] = 0
+                if at_end and occupied_end:
+                    self._bump(x0, y0, self.L_OCC)
+                else:
+                    self._bump(x0, y0, self.L_FREE)
 
             if at_end:
                 break
