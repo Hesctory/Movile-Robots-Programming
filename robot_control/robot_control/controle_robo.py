@@ -29,22 +29,20 @@ class ControleRobo(Node):
     # --- control loop ---
     # Single source of truth for the timer period. All tick-based durations below
     # are derived from seconds via this value, so the loop rate can be changed here
-    # without altering any real-world timing. Raised to 20 Hz for racing: halves the
-    # per-tick travel distance, tightening obstacle reaction at the higher speeds.
-    CONTROL_PERIOD = 0.05   # seconds (20 Hz)
+    # without altering any real-world timing.
+    CONTROL_PERIOD = 0.1    # seconds (10 Hz)
 
     # --- grid (must match robot_mapper constants) ---
     GRID_SIZE = 100
     GRID_RESOLUTION = 0.2
-    OBSTACLE_INFLATE_RADIUS = 1   # cells of safety margin around obstacles
+    OBSTACLE_INFLATE_RADIUS = 3   # cells of safety margin around obstacles
 
     # --- distances (metres) ---
-    OBSTACLE_FRONT = 0.6   # raised for racing: brake/avoid earlier at higher speed (open-space reaction)
-    # Block-check distance while FOLLOWING an A* path. A* only inflates obstacles by
-    # OBSTACLE_INFLATE_RADIUS (1 cell = 0.2 m), so a valid planned path legitimately threads
-    # pillar gaps ~0.35 m from each pillar. Using the full 0.8 m OBSTACLE_FRONT here would
-    # reject A*'s own corridors and deadlock (turn-away → re-plan → identical path). This
-    # smaller value only flags an obstacle CLOSER than A* planned for — a genuine surprise.
+    OBSTACLE_FRONT = 0.6   # open-space reaction: engage avoidance when the front is this close
+    # Block-check distance while FOLLOWING an A* path. A valid planned path legitimately
+    # threads gaps close to obstacles, so using the larger open-space OBSTACLE_FRONT here
+    # would reject A*'s own corridors and deadlock (turn-away → re-plan → identical path).
+    # This smaller value only flags an obstacle CLOSER than A* planned for — a real surprise.
     PATH_BLOCKED_DIST = 0.5
     CLOSE_ENOUGH = 0.7
     TARGET_DIST = 0.3
@@ -75,7 +73,7 @@ class ControleRobo(Node):
     DONE_TICKS = int(1.0 / CONTROL_PERIOD)   # ~1 s held aligned to declare "done"
 
     # --- waypoint following ---
-    WAYPOINT_TOLERANCE = 0.25   # metres — distance to consider a waypoint reached (raised for racing)
+    WAYPOINT_TOLERANCE = 0.20   # metres — distance to consider a waypoint reached
     WAYPOINT_STRIDE = 2         # keep every Nth cell from A* path
     REPLAN_INTERVAL = int(5.0 / CONTROL_PERIOD)        # ticks between periodic re-plans (~5 s)
     ASTAR_RETRY_INTERVAL = int(2.0 / CONTROL_PERIOD)   # ticks — retry A* every 2 s when it previously failed
@@ -99,11 +97,11 @@ class ControleRobo(Node):
     TIPPED_CELL_PENALTY = 25.0 # A* cost added to cells where tipping occurred (high but passable)
     TIPPED_INFLATE_RADIUS = 3  # inflate tipped area by this many cells in every direction
 
-    # --- speeds (raised for racing) ---
-    EXPLORE_SPEED = 0.40
-    NAV_SPEED = 0.25
-    CREEP_SPEED = 0.10
-    TURN_SPEED = 0.6
+    # --- speeds ---
+    EXPLORE_SPEED = 0.25
+    NAV_SPEED = 0.12
+    CREEP_SPEED = 0.06
+    TURN_SPEED = 0.4
     ALIGN_SPEED = 0.5
 
     # --- gains ---
@@ -113,7 +111,7 @@ class ControleRobo(Node):
 
     # --- exploration ---
     SPIN_TICKS = int(2 * math.pi / (TURN_SPEED * CONTROL_PERIOD)) + 5
-    OBSTACLE_CLEAR = 1.0   # hysteresis: stop avoiding only when front opens to this distance (raised with OBSTACLE_FRONT)
+    OBSTACLE_CLEAR = 0.8   # hysteresis: stop avoiding only when front opens to this distance
 
     # --- circumnavigation ---
     CIRCUM_WALL_DIST = 0.45   # target gap to keep from the wall (m)
@@ -139,7 +137,7 @@ class ControleRobo(Node):
     LIFT_TICKS = int(3.0 / CONTROL_PERIOD)   # ticks to let the arm raise before declaring done (~3 s)
 
     # --- return to base (carrying the flag) ---
-    RETURN_SPEED = 0.20     # m/s — kept below NAV_SPEED for stability with the load
+    RETURN_SPEED = 0.10     # m/s — slower than NAV_SPEED for stability with the load
     HOME_TOLERANCE = 0.30   # m — distance to home that counts as arrived
     FINAL_APPROACH_DIST = 0.7  # m — within this of home, abandon A*/obstacle-turn and creep straight in
     #   (home sits against the arena wall, so its grid cell is inside wall inflation: A* keeps
